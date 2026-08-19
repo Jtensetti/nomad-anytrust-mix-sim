@@ -13,8 +13,9 @@ Implemented:
 - strict 1200-byte serialization for the constant-rate test profile.
 - committee/epoch/batch/round-bound shuffle proofs with Ed25519-signed mixer
   receipts and replay/equivocation tracking;
-- dealer-generated Shamir committee fixtures for threshold decryption without
-  reconstructing the aggregate secret;
+- Kyber's authenticated Pedersen DKG state machine with signed deals and
+  responses, plus a dealer fixture kept only for focused unit tests;
+- threshold decryption without reconstructing the aggregate secret;
 - Fiat-Shamir proofs that each partial decryption uses the member share
   committed in the public committee configuration.
 
@@ -23,9 +24,9 @@ Run go test -race ./..., go vet ./... and go run ./cmd/mix-sim.
 ## Security boundary
 
 This is a research integration of established constructions, not an audited
-Nomad mixnet. The threshold fixture still has a trusted dealer during key
-generation. Authenticated distributed key generation, secret-service/process
-isolation, membership admission, network-level delay/drop accountability,
-forward-secure epoch rotation and independent review remain production gates.
+Nomad mixnet. The authenticated DKG currently runs through an in-memory
+broadcast harness. Production transport, secret-service/process isolation,
+membership admission, network-level delay/drop accountability, forward-secure
+epoch rotation and independent review remain production gates.
 Kyber also requires an application-specific security review before
 security-critical deployment.
