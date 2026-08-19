@@ -6,8 +6,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with: {go-version: '1.23.x'}
+      - name: Resolve module checksums
+        run: |
+          go mod tidy
+          printf 'GO_SUM_BASE64='
+          base64 -w0 go.sum
+          printf '\n'
       - run: go test -race ./...
       - run: go vet ./...
