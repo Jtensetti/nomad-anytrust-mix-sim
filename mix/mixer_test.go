@@ -5,41 +5,51 @@ import (
 	"testing"
 )
 
-func TestHonestMixChangesRepresentation(t *testing.T) {
+func TestShuffleModelPreservesTagsAndChangesEachTaggedRepresentation(t *testing.T) {
 	in := make([]TaggedCell, 256)
+	original := make(map[uint64]Cell, len(in))
 	for i := range in {
-		c, err := NewTagged(uint64(i))
+		cell, err := NewTagged(uint64(i))
 		if err != nil {
 			t.Fatal(err)
 		}
-		in[i] = c
+		in[i] = cell
+		original[cell.Tag] = cell.Cell
 	}
-	out, err := HonestMix(Config{MinBatch: 64}, in)
+	out, err := ShuffleModel(Config{MinBatch: 64}, in)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out) != len(in) {
-		t.Fatal("batch size changed")
+		t.Fatalf("batch size changed from %d to %d", len(in), len(out))
 	}
-	unchanged := 0
-	for i := range out {
-		if bytes.Equal(out[i].Cell[:], in[i].Cell[:]) {
-			unchanged++
+	seen := make(map[uint64]bool, len(out))
+	for _, mixed := range out {
+		if seen[mixed.Tag] {
+			t.Fatalf("duplicate tag %d", mixed.Tag)
+		}
+		seen[mixed.Tag] = true
+		before, ok := original[mixed.Tag]
+		if !ok {
+			t.Fatalf("unknown tag %d", mixed.Tag)
+		}
+		if bytes.Equal(before[:], mixed.Cell[:]) {
+			t.Fatalf("tag %d retained its original representation", mixed.Tag)
 		}
 	}
-	if unchanged != 0 {
-		t.Fatalf("%d cells retained representation", unchanged)
+	if len(seen) != len(in) {
+		t.Fatalf("saw %d unique tags, want %d", len(seen), len(in))
 	}
 }
 
 func TestFailClosedBelowThreshold(t *testing.T) {
 	in := make([]TaggedCell, 7)
-	if _, err := HonestMix(Config{MinBatch: 8}, in); err != ErrBatchTooSmall {
+	if _, err := ShuffleModel(Config{MinBatch: 8}, in); err != ErrBatchTooSmall {
 		t.Fatalf("expected ErrBatchTooSmall, got %v", err)
 	}
 }
 
-func TestRandomGuessBaseline(t *testing.T) {
+func TestRandomGuessBaselineFormula(t *testing.T) {
 	got := RandomGuessRecall(5000, 16)
 	want := 16.0 / 5000.0
 	if got != want {

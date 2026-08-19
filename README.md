@@ -1,29 +1,30 @@
 # nomad-anytrust-mix-sim
 
-Executable research model for Nomad's **anytrust batch-mixing invariant**.
+A simulation of one batch-shuffle property needed by the Nomad experiments.
 
-The simulator models a batch mixer that:
+Despite the repository name, this code does **not** implement an anytrust committee protocol or a mixnet cryptosystem. It models a single honest shuffle stage so surrounding code can test batch thresholds and ground-truth bookkeeping without inventing cryptography.
 
-1. refuses batches below a configured anonymity threshold,
-2. applies a secret unbiased permutation,
-3. replaces every cell representation with a fresh re-randomized representation,
-4. exposes no application-selected timing channel.
+`ShuffleModel`:
 
-The intended security assumption is **anytrust**: privacy should survive when at least one critical mix stage behaves honestly. This repository tests statistical consequences of that assumption; it does not claim to implement a formally verified deployable mixnet cryptosystem.
+1. rejects batches below a configured minimum,
+2. applies a CSPRNG-driven Fisher–Yates permutation,
+3. replaces every test representation with a fresh model representation.
 
-## Build and test
+`TaggedCell.Tag` exists only as test-harness ground truth. It is not encoded in `Cell` and must never be treated as a wire field.
+
+## What is meaningful here
+
+- configured minimum-batch behavior,
+- permutation preserves the cohort exactly once,
+- the model replacement changes each tagged representation,
+- a random-position adversary lands at the combinatorial baseline.
+
+## What is deliberately absent
+
+`modelReRandomize` destroys payloads. There is no payload-preserving re-randomizable encryption, verifiable shuffle, threshold key protocol, malicious-mixer accountability, active-tagging defense or availability protocol. A real mix layer must replace this repository's model boundary with a reviewed construction.
 
 ```bash
-go test ./...
 go test -race ./...
 go vet ./...
-go run ./cmd/mix-sim -batch 5000 -targets 16 -rounds 10000
+go run ./cmd/mix-sim -batch 1000 -targets 16 -rounds 100
 ```
-
-The Monte Carlo output should converge on the random-guess baseline.
-
-## Security boundaries
-
-- `Tag` is test-only ground truth and never encoded in the simulated cell.
-- `ReRandomize` models a property; it is intentionally not presented as production cryptography.
-- A real system would need a reviewed re-randomizable encryption or verifiable shuffle construction, robust batch integrity, active-tagging defenses, and formal proofs.

@@ -30,11 +30,10 @@ func NewTagged(tag uint64) (TaggedCell, error) {
 	return TaggedCell{Tag: tag, Cell: c}, err
 }
 
-// ReRandomize transforms a cell into a fresh pseudorandom-looking cell while
-// preserving only a simulation commitment to the input. This models the
-// unlinkability property expected from a real re-randomizable cryptosystem;
-// it is NOT itself a deployable mixnet cryptosystem.
-func ReRandomize(in Cell, nonce [32]byte) Cell {
+// modelReRandomize transforms a cell into a fresh pseudorandom-looking cell.
+// It deliberately destroys the payload and exists only to model representation
+// replacement across a shuffle boundary.
+func modelReRandomize(in Cell, nonce [32]byte) Cell {
 	var out Cell
 	for block, off := uint64(0), 0; off < len(out); block++ {
 		h := sha256.New()
@@ -56,4 +55,4 @@ func freshNonce() ([32]byte, error) {
 	return n, err
 }
 
-var ErrBatchTooSmall = errors.New("batch smaller than anonymity threshold")
+var ErrBatchTooSmall = errors.New("batch smaller than configured minimum")
