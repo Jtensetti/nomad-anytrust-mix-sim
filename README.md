@@ -1,30 +1,32 @@
-# nomad-anytrust-mix-sim
+# Nomad verifiable batch-mix prototype
 
-A simulation of one batch-shuffle property needed by the Nomad experiments.
+This repository carries payloads through independently randomized, verifiable batch shuffles. It uses Kyber's implementation of Andrew Neff's verifiable shuffle of ElGamal pairs. Nomad code does not implement the shuffle proof itself.
 
-Despite the repository name, this code does **not** implement an anytrust committee protocol or a mixnet cryptosystem. It models a single honest shuffle stage so surrounding code can test batch thresholds and ground-truth bookkeeping without inventing cryptography.
+The v0.1 profile encodes each 504-byte clear cell as eighteen ElGamal pairs. A mixed representation occupies 1152 bytes and receives 48 bytes of fresh padding to form one 1200-byte wire cell. All chunks of a cell follow the same secret permutation.
 
-`ShuffleModel`:
+Implemented:
 
-1. rejects batches below a configured minimum,
-2. applies a CSPRNG-driven Fisher–Yates permutation,
-3. replaces every test representation with a fresh model representation.
+- payload-preserving ElGamal re-randomization;
+- non-interactive correctness proofs for every shuffle round;
+- exact batch-size preservation and fail-closed proof verification;
+- an anytrust committee chain: one honest permutation is sufficient to hide the ordering from the other mixers;
+- strict 1200-byte serialization for the constant-rate test profile.
+- committee/epoch/batch/round-bound shuffle proofs with Ed25519-signed mixer
+  receipts and replay/equivocation tracking;
+- Kyber's authenticated Pedersen DKG state machine with signed deals and
+  responses, plus a dealer fixture kept only for focused unit tests;
+- threshold decryption without reconstructing the aggregate secret;
+- Fiat-Shamir proofs that each partial decryption uses the member share
+  committed in the public committee configuration.
 
-`TaggedCell.Tag` exists only as test-harness ground truth. It is not encoded in `Cell` and must never be treated as a wire field.
+Run go test -race ./..., go vet ./... and go run ./cmd/mix-sim.
 
-## What is meaningful here
+## Security boundary
 
-- configured minimum-batch behavior,
-- permutation preserves the cohort exactly once,
-- the model replacement changes each tagged representation,
-- a random-position adversary lands at the combinatorial baseline.
-
-## What is deliberately absent
-
-`modelReRandomize` destroys payloads. There is no payload-preserving re-randomizable encryption, verifiable shuffle, threshold key protocol, malicious-mixer accountability, active-tagging defense or availability protocol. A real mix layer must replace this repository's model boundary with a reviewed construction.
-
-```bash
-go test -race ./...
-go vet ./...
-go run ./cmd/mix-sim -batch 1000 -targets 16 -rounds 100
-```
+This is a research integration of established constructions, not an audited
+Nomad mixnet. The authenticated DKG currently runs through an in-memory
+broadcast harness. Production transport, secret-service/process isolation,
+membership admission, network-level delay/drop accountability, forward-secure
+epoch rotation and independent review remain production gates.
+Kyber also requires an application-specific security review before
+security-critical deployment.
