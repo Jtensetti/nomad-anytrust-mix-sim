@@ -147,15 +147,66 @@ func validateThresholdCommittee(committee ThresholdCommittee) error {
 		return errors.New("invalid committee threshold")
 	}
 	s := newSuite()
-	if _, err := publicPoint(s, committee.PublicKey); err != nil {
+	key, err := publicPoint(s, committee.PublicKey)
+	if err != nil {
+		return fmt.Errorf("committee public key: %w", err)
+	}
+	if err := rejectSmallOrder(s, key); err != nil {
 		return fmt.Errorf("committee public key: %w", err)
 	}
 	for index, member := range committee.Members {
 		if member.Index != uint32(index) {
 			return errors.New("committee members must have contiguous ordered indexes")
 		}
-		if _, err := sharePublicPoint(s, member.Share); err != nil {
+		memberShare, err := sharePublicPoint(s, member.Share)
+		if err != nil {
 			return fmt.Errorf("member %d public share: %w", index, err)
+		}
+		if err := rejectSmallOrder(s, memberShare); err != nil {
+			return fmt.Errorf("member %d public share: %w", index, err)
+		}
+	}
+	return nil
+}
+
+// rejectSmallOrder refuses the identity and the small-order points of the
+// curve.
+//
+// Decoding alone does not establish that a key is usable: the all-zero
+// encoding is a valid point of order 4, so a committee "public key" of small
+// order masks a plaintext with only a handful of possible values and anything
+// encrypted to it is recoverable with no key material at all. The cofactor is
+// 8, so clearing it and testing for the identity catches the whole
+// small-order subgroup.
+func rejectSmallOrder(s proof.Suite, point kyber.Point) error {
+	if point.Equal(s.Point().Null()) {
+		return errors.New("point is the group identity")
+	}
+	if s.Point().Mul(s.Scalar().SetInt64(8), point).Equal(s.Point().Null()) {
+		return errors.New("point lies in the small-order subgroup")
+	}
+	return nil
+}
+
+// ValidateCiphertextColumn checks that one wire cell decodes as a batch column
+// of usable points. It is stricter than ParseWire, which only requires the
+// points to decode: an honest ElGamal ciphertext has x = rG for a uniform r,
+// so a small-order point appears with probability around 2^-252, while a
+// column of identity points is exactly what an attacker submits to occupy a
+// slot with something that cannot decrypt.
+func ValidateCiphertextColumn(cell WireCell) error {
+	s := newSuite()
+	offset := 0
+	for row := 0; row < ChunkCount; row++ {
+		for pair := 0; pair < 2; pair++ {
+			p := s.Point()
+			if err := p.UnmarshalBinary(cell[offset : offset+pointSize]); err != nil {
+				return fmt.Errorf("chunk %d point %d: %w", row, pair, err)
+			}
+			if err := rejectSmallOrder(s, p); err != nil {
+				return fmt.Errorf("chunk %d point %d: %w", row, pair, err)
+			}
+			offset += pointSize
 		}
 	}
 	return nil
@@ -369,7 +420,76 @@ func ThresholdDecrypt(committee ThresholdCommittee, batch *Batch, partials []*Pa
 		return nil, errors.New("not enough unique partial decryptions")
 	}
 
-	out := make([]PlainCell, batch.Len())
+	columns, err := recoverColumns(s, committee, batch, decoded)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PlainCell, len(columns))
+	for index, column := range columns {
+		if column.Err != nil {
+			return nil, column.Err
+		}
+		out[index] = column.Cell
+	}
+	return out, nil
+}
+
+// DecryptedCell is one column's outcome. Err is set when that column alone
+// could not be recovered.
+type DecryptedCell struct {
+	Cell PlainCell
+	Err  error
+}
+
+// ThresholdDecryptColumns is ThresholdDecrypt except that one undecryptable
+// column does not censor the rest.
+//
+// A ciphertext built from valid curve points that is not a real encryption
+// passes every structural check and every shuffle proof -- a shuffle proof
+// shows a permutation, not decryptability -- and fails only here. Under an
+// all-or-nothing decryption, one such column discards every other sender's
+// plaintext in the batch after the committee has already spent its budget on
+// it. Callers that batch independent senders must use this form and drop the
+// failing column.
+func ThresholdDecryptColumns(committee ThresholdCommittee, batch *Batch, partials []*PartialDecryption) ([]DecryptedCell, error) {
+	if err := validateThresholdCommittee(committee); err != nil {
+		return nil, err
+	}
+	if err := validateBatch(batch); err != nil {
+		return nil, err
+	}
+	if len(partials) < int(committee.Threshold) {
+		return nil, errors.New("not enough partial decryptions")
+	}
+	seen := make(map[uint32]struct{}, len(partials))
+	decoded := make(map[uint32][]kyber.Point, len(partials))
+	s := newSuite()
+	for _, partial := range partials {
+		if err := VerifyPartialDecryption(committee, batch, partial); err != nil {
+			return nil, err
+		}
+		if _, exists := seen[partial.MemberIndex]; exists {
+			return nil, errors.New("duplicate partial-decryption member")
+		}
+		seen[partial.MemberIndex] = struct{}{}
+		points := make([]kyber.Point, len(partial.Points))
+		for index := range partial.Points {
+			points[index] = s.Point()
+			if err := points[index].UnmarshalBinary(partial.Points[index][:]); err != nil {
+				return nil, err
+			}
+		}
+		decoded[partial.MemberIndex] = points
+	}
+	if len(seen) < int(committee.Threshold) {
+		return nil, errors.New("not enough unique partial decryptions")
+	}
+	return recoverColumns(s, committee, batch, decoded)
+}
+
+func recoverColumns(s proof.Suite, committee ThresholdCommittee, batch *Batch,
+	decoded map[uint32][]kyber.Point) ([]DecryptedCell, error) {
+	out := make([]DecryptedCell, batch.Len())
 	for col := 0; col < batch.Len(); col++ {
 		for row := 0; row < ChunkCount; row++ {
 			pointIndex := row*batch.Len() + col
@@ -379,17 +499,21 @@ func ThresholdDecrypt(committee ThresholdCommittee, batch *Batch, partials []*Pa
 			}
 			sharedPoint, err := share.RecoverCommit(s, publicShares, committee.Threshold, uint32(len(committee.Members)))
 			if err != nil {
+				// A committee-level fault rather than a property of this
+				// column, so it fails the call.
 				return nil, fmt.Errorf("recover shared point for cell %d chunk %d: %w", col, row, err)
 			}
 			message := s.Point().Sub(batch.y[row][col], sharedPoint)
 			data, err := message.Data()
 			if err != nil {
-				return nil, fmt.Errorf("decrypt cell %d chunk %d: %w", col, row, err)
+				out[col].Err = fmt.Errorf("decrypt cell %d chunk %d: %w", col, row, err)
+				break
 			}
 			if len(data) != ChunkSize {
-				return nil, fmt.Errorf("decrypt cell %d chunk %d: got %d bytes", col, row, len(data))
+				out[col].Err = fmt.Errorf("decrypt cell %d chunk %d: got %d bytes", col, row, len(data))
+				break
 			}
-			copy(out[col][row*ChunkSize:], data)
+			copy(out[col].Cell[row*ChunkSize:], data)
 		}
 	}
 	return out, nil
