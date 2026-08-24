@@ -175,9 +175,9 @@ func validateThresholdCommittee(committee ThresholdCommittee) error {
 // Decoding alone does not establish that a key is usable: the all-zero
 // encoding is a valid point of order 4, so a committee "public key" of small
 // order masks a plaintext with only a handful of possible values and anything
-// encrypted to it is recoverable with no key material at all. The cofactor is
-// 8, so clearing it and testing for the identity catches the whole
-// small-order subgroup.
+// encrypted to it -- publication cover among other things -- is recoverable
+// with no key material at all. The cofactor is 8, so clearing it and testing
+// for the identity catches the whole small-order subgroup.
 func rejectSmallOrder(s proof.Suite, point kyber.Point) error {
 	if point.Equal(s.Point().Null()) {
 		return errors.New("point is the group identity")
@@ -188,28 +188,10 @@ func rejectSmallOrder(s proof.Suite, point kyber.Point) error {
 	return nil
 }
 
-// ValidateCiphertextColumn checks that one wire cell decodes as a batch column
-// of usable points. It is stricter than ParseWire, which only requires the
-// points to decode: an honest ElGamal ciphertext has x = rG for a uniform r,
-// so a small-order point appears with probability around 2^-252, while a
-// column of identity points is exactly what an attacker submits to occupy a
-// slot with something that cannot decrypt.
-func ValidateCiphertextColumn(cell WireCell) error {
-	s := newSuite()
-	offset := 0
-	for row := 0; row < ChunkCount; row++ {
-		for pair := 0; pair < 2; pair++ {
-			p := s.Point()
-			if err := p.UnmarshalBinary(cell[offset : offset+pointSize]); err != nil {
-				return fmt.Errorf("chunk %d point %d: %w", row, pair, err)
-			}
-			if err := rejectSmallOrder(s, p); err != nil {
-				return fmt.Errorf("chunk %d point %d: %w", row, pair, err)
-			}
-			offset += pointSize
-		}
-	}
-	return nil
+// ValidateThresholdCommittee validates public committee material received from
+// an authenticated external DKG certificate.
+func ValidateThresholdCommittee(committee ThresholdCommittee) error {
+	return validateThresholdCommittee(committee)
 }
 
 func isZeroCommitteeID(id CommitteeID) bool {
@@ -243,22 +225,49 @@ func memberForIndex(committee ThresholdCommittee, index uint32) (PublicMember, e
 	return member, nil
 }
 
-func CreatePartialDecryption(committee ThresholdCommittee, member MemberSecret, batch *Batch) (*PartialDecryption, error) {
+// ValidateMemberSecret proves that an operator's private scalar is the
+// discrete-log witness for the public share pinned by the certified
+// committee. Callers loading a share from storage must run this before the
+// share is accepted, rather than waiting until the first decryption request.
+func ValidateMemberSecret(committee ThresholdCommittee, member MemberSecret) error {
 	if err := validateThresholdCommittee(committee); err != nil {
+		return err
+	}
+	if member.CommitteeID != committee.ID || member.Epoch != committee.Epoch {
+		return errors.New("member secret belongs to a different committee epoch")
+	}
+	publicMember, err := memberForIndex(committee, member.Index)
+	if err != nil {
+		return err
+	}
+	if publicMember.Share != member.Public {
+		return errors.New("member public share does not match committee registry")
+	}
+	s := newSuite()
+	secret, err := privateShareScalar(s, member.Secret)
+	if err != nil {
+		return fmt.Errorf("decode member secret: %w", err)
+	}
+	publicShare, err := sharePublicPoint(s, member.Public)
+	if err != nil {
+		return fmt.Errorf("decode member public share: %w", err)
+	}
+	if !s.Point().Mul(secret, nil).Equal(publicShare) {
+		return errors.New("member secret does not match its public share")
+	}
+	return nil
+}
+
+func CreatePartialDecryption(committee ThresholdCommittee, member MemberSecret, batch *Batch) (*PartialDecryption, error) {
+	if err := ValidateMemberSecret(committee, member); err != nil {
 		return nil, err
 	}
 	if err := validateBatch(batch); err != nil {
 		return nil, err
 	}
-	if member.CommitteeID != committee.ID || member.Epoch != committee.Epoch {
-		return nil, errors.New("member secret belongs to a different committee epoch")
-	}
 	publicMember, err := memberForIndex(committee, member.Index)
 	if err != nil {
 		return nil, err
-	}
-	if publicMember.Share != member.Public {
-		return nil, errors.New("member public share does not match committee registry")
 	}
 
 	s := newSuite()
@@ -270,10 +279,6 @@ func CreatePartialDecryption(committee ThresholdCommittee, member MemberSecret, 
 	if err != nil {
 		return nil, fmt.Errorf("decode member public share: %w", err)
 	}
-	if !s.Point().Mul(secret, nil).Equal(publicShare) {
-		return nil, errors.New("member secret does not match its public share")
-	}
-
 	batchDigest, err := batch.Digest()
 	if err != nil {
 		return nil, err
@@ -387,40 +392,7 @@ func VerifyPartialDecryption(committee ThresholdCommittee, batch *Batch, partial
 }
 
 func ThresholdDecrypt(committee ThresholdCommittee, batch *Batch, partials []*PartialDecryption) ([]PlainCell, error) {
-	if err := validateThresholdCommittee(committee); err != nil {
-		return nil, err
-	}
-	if err := validateBatch(batch); err != nil {
-		return nil, err
-	}
-	if len(partials) < int(committee.Threshold) {
-		return nil, errors.New("not enough partial decryptions")
-	}
-	seen := make(map[uint32]struct{}, len(partials))
-	decoded := make(map[uint32][]kyber.Point, len(partials))
-	s := newSuite()
-	for _, partial := range partials {
-		if err := VerifyPartialDecryption(committee, batch, partial); err != nil {
-			return nil, err
-		}
-		if _, exists := seen[partial.MemberIndex]; exists {
-			return nil, errors.New("duplicate partial-decryption member")
-		}
-		seen[partial.MemberIndex] = struct{}{}
-		points := make([]kyber.Point, len(partial.Points))
-		for index := range partial.Points {
-			points[index] = s.Point()
-			if err := points[index].UnmarshalBinary(partial.Points[index][:]); err != nil {
-				return nil, err
-			}
-		}
-		decoded[partial.MemberIndex] = points
-	}
-	if len(seen) < int(committee.Threshold) {
-		return nil, errors.New("not enough unique partial decryptions")
-	}
-
-	columns, err := recoverColumns(s, committee, batch, decoded)
+	columns, err := ThresholdDecryptColumns(committee, batch, partials)
 	if err != nil {
 		return nil, err
 	}
@@ -448,9 +420,10 @@ type DecryptedCell struct {
 // passes every structural check and every shuffle proof -- a shuffle proof
 // shows a permutation, not decryptability -- and fails only here. Under an
 // all-or-nothing decryption, one such column discards every other sender's
-// plaintext in the batch after the committee has already spent its budget on
-// it. Callers that batch independent senders must use this form and drop the
-// failing column.
+// plaintext in the batch, after the whole committee has already spent its
+// budget on it. Callers that batch independent senders must use this form and
+// drop the failing column, so one poisoned entry cannot censor its
+// neighbours.
 func ThresholdDecryptColumns(committee ThresholdCommittee, batch *Batch, partials []*PartialDecryption) ([]DecryptedCell, error) {
 	if err := validateThresholdCommittee(committee); err != nil {
 		return nil, err
@@ -458,6 +431,15 @@ func ThresholdDecryptColumns(committee ThresholdCommittee, batch *Batch, partial
 	if err := validateBatch(batch); err != nil {
 		return nil, err
 	}
+	decoded, err := verifiedPartialPoints(committee, batch, partials)
+	if err != nil {
+		return nil, err
+	}
+	return recoverColumns(newSuite(), committee, batch, decoded)
+}
+
+func verifiedPartialPoints(committee ThresholdCommittee, batch *Batch,
+	partials []*PartialDecryption) (map[uint32][]kyber.Point, error) {
 	if len(partials) < int(committee.Threshold) {
 		return nil, errors.New("not enough partial decryptions")
 	}
@@ -484,7 +466,7 @@ func ThresholdDecryptColumns(committee ThresholdCommittee, batch *Batch, partial
 	if len(seen) < int(committee.Threshold) {
 		return nil, errors.New("not enough unique partial decryptions")
 	}
-	return recoverColumns(s, committee, batch, decoded)
+	return decoded, nil
 }
 
 func recoverColumns(s proof.Suite, committee ThresholdCommittee, batch *Batch,
@@ -499,8 +481,8 @@ func recoverColumns(s proof.Suite, committee ThresholdCommittee, batch *Batch,
 			}
 			sharedPoint, err := share.RecoverCommit(s, publicShares, committee.Threshold, uint32(len(committee.Members)))
 			if err != nil {
-				// A committee-level fault rather than a property of this
-				// column, so it fails the call.
+				// Share recovery failing is a committee-level fault rather
+				// than a property of this column, so it fails the call.
 				return nil, fmt.Errorf("recover shared point for cell %d chunk %d: %w", col, row, err)
 			}
 			message := s.Point().Sub(batch.y[row][col], sharedPoint)
@@ -534,4 +516,32 @@ func partialProofDomain(committee ThresholdCommittee, member PublicMember, batch
 	_, _ = h.Write(member.Share[:])
 	_, _ = h.Write(batchDigest[:])
 	return thresholdProofLabel + ":" + hex.EncodeToString(h.Sum(nil))
+}
+
+// ValidateCiphertextColumn checks that one wire cell decodes as a batch column
+// of usable points.
+//
+// It is stricter than ParseWire, which only requires the points to decode. An
+// honest ElGamal ciphertext has x = rG for a uniform r and y = M + rH, so a
+// point of small order appears with probability around 2^-252 -- never, in
+// practice. A column of identity points, on the other hand, is exactly what an
+// attacker submits to occupy a slot with something that cannot decrypt, so it
+// is refused at the boundary rather than discovered after the committee has
+// spent its budget on it.
+func ValidateCiphertextColumn(cell WireCell) error {
+	s := newSuite()
+	offset := 0
+	for row := 0; row < ChunkCount; row++ {
+		for pair := 0; pair < 2; pair++ {
+			p := s.Point()
+			if err := p.UnmarshalBinary(cell[offset : offset+pointSize]); err != nil {
+				return fmt.Errorf("chunk %d point %d: %w", row, pair, err)
+			}
+			if err := rejectSmallOrder(s, p); err != nil {
+				return fmt.Errorf("chunk %d point %d: %w", row, pair, err)
+			}
+			offset += pointSize
+		}
+	}
+	return nil
 }

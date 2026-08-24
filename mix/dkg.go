@@ -25,6 +25,7 @@ type dkgParticipant struct {
 	index    uint32
 	identity kyber.Scalar
 	public   kyber.Point
+	config   *dkg.Config
 	handler  *dkg.DistKeyGenerator
 }
 
@@ -34,6 +35,27 @@ type dkgParticipant struct {
 // removes the trusted dealer from key generation, but it does not provide the
 // production network, membership admission or isolated secret storage.
 func RunAuthenticatedDKG(id CommitteeID, epoch uint64, members, threshold uint32) (ThresholdCommittee, []MemberSecret, DKGTranscript, error) {
+	if members < minCommitteeMembers || members > maxCommitteeMembers {
+		return ThresholdCommittee{}, nil, DKGTranscript{}, errors.New("invalid DKG member count")
+	}
+	identities := make([]DKGPrivateIdentity, members)
+	for index := range identities {
+		_, private, err := GenerateDKGIdentity()
+		if err != nil {
+			return ThresholdCommittee{}, nil, DKGTranscript{}, err
+		}
+		identities[index] = private
+	}
+	nonce := dkg.GetNonce()
+	return RunAuthenticatedDKGWithIdentities(id, epoch, identities, threshold, nonce)
+}
+
+// RunAuthenticatedDKGWithIdentities is the deterministic-membership variant
+// used by topology-bound integration fixtures. Production operators use the
+// networked Kyber Protocol runner instead; this helper still executes all
+// signed Pedersen packet transitions but transports them in memory.
+func RunAuthenticatedDKGWithIdentities(id CommitteeID, epoch uint64, privateIdentities []DKGPrivateIdentity, threshold uint32, nonce []byte) (ThresholdCommittee, []MemberSecret, DKGTranscript, error) {
+	members := uint32(len(privateIdentities))
 	if isZeroCommitteeID(id) {
 		return ThresholdCommittee{}, nil, DKGTranscript{}, errors.New("committee ID is required")
 	}
@@ -46,19 +68,21 @@ func RunAuthenticatedDKG(id CommitteeID, epoch uint64, members, threshold uint32
 	if threshold < 2 || threshold > members {
 		return ThresholdCommittee{}, nil, DKGTranscript{}, errors.New("invalid DKG threshold")
 	}
+	if len(nonce) != dkg.NonceLength {
+		return ThresholdCommittee{}, nil, DKGTranscript{}, errors.New("invalid DKG nonce length")
+	}
 
 	s := newSuite()
 	participants := make([]dkgParticipant, members)
 	nodes := make([]dkg.Node, members)
 	for index := uint32(0); index < members; index++ {
-		identity := s.Scalar().Pick(s.RandomStream())
+		identity, err := decodeDKGPrivate(s, privateIdentities[index])
+		if err != nil {
+			return ThresholdCommittee{}, nil, DKGTranscript{}, fmt.Errorf("decode DKG member %d identity: %w", index, err)
+		}
 		public := s.Point().Mul(identity, nil)
 		participants[index] = dkgParticipant{index: index, identity: identity, public: public}
 		nodes[index] = dkg.Node{Index: index, Public: public}
-	}
-	nonce := dkg.GetNonce()
-	if len(nonce) != 32 {
-		return ThresholdCommittee{}, nil, DKGTranscript{}, errors.New("unexpected DKG nonce size")
 	}
 	authentication := schnorr.NewScheme(s)
 	for index := range participants {
@@ -75,6 +99,7 @@ func RunAuthenticatedDKG(id CommitteeID, epoch uint64, members, threshold uint32
 		if err != nil {
 			return ThresholdCommittee{}, nil, DKGTranscript{}, fmt.Errorf("create DKG member %d: %w", index, err)
 		}
+		participants[index].config = config
 		participants[index].handler = handler
 	}
 
@@ -86,6 +111,11 @@ func RunAuthenticatedDKG(id CommitteeID, epoch uint64, members, threshold uint32
 		}
 		deals = append(deals, bundle)
 	}
+	for _, bundle := range deals {
+		if err := dkg.VerifyPacketSignature(participants[0].config, bundle); err != nil {
+			return ThresholdCommittee{}, nil, DKGTranscript{}, fmt.Errorf("verify DKG deal: %w", err)
+		}
+	}
 	responses := make([]*dkg.ResponseBundle, 0, members)
 	for index := range participants {
 		bundle, err := participants[index].handler.ProcessDeals(deals)
@@ -94,6 +124,11 @@ func RunAuthenticatedDKG(id CommitteeID, epoch uint64, members, threshold uint32
 		}
 		if bundle != nil {
 			responses = append(responses, bundle)
+		}
+	}
+	for _, bundle := range responses {
+		if err := dkg.VerifyPacketSignature(participants[0].config, bundle); err != nil {
+			return ThresholdCommittee{}, nil, DKGTranscript{}, fmt.Errorf("verify DKG response: %w", err)
 		}
 	}
 	results := make([]*dkg.Result, members)
