@@ -29,12 +29,20 @@ func (l *lane) scalar() kyber.Scalar { return l.suite.Scalar() }
 // does not leave one goroutine finishing long after the rest. work must write
 // only to its own index; nothing here synchronises anything else.
 func parallel(count int, work func(l *lane, index int)) {
+	if count < 1 {
+		return
+	}
 	workers := runtime.GOMAXPROCS(0)
 	if workers > count {
 		workers = count
 	}
+	// Unreachable while GOMAXPROCS honours its contract of returning at least
+	// one, and not covered by a test for that reason. It is here because this
+	// function now guards five call sites: if the branch ever were reachable,
+	// degrading to one worker is slow, where skipping the work would hand
+	// Encrypt nil rows and recoverColumns all-zero cells, with no error.
 	if workers < 1 {
-		return
+		workers = 1
 	}
 	var next atomic.Int64
 	var group sync.WaitGroup
